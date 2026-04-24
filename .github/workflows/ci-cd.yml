@@ -14,6 +14,9 @@ permissions:
 
 jobs:
 
+  # -----------------------------
+  # 1. Detect Changes
+  # -----------------------------
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
@@ -25,57 +28,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Ensure scripts are executable
-        run: chmod +x scripts/ci/helpers.sh
-
       - name: Detect changed services
         id: set-matrix
-        shell: bash
         run: |
           set -euo pipefail
 
-          BASE_SHA=""
-          HEAD_SHA="${{ github.sha }}"
+          FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin "${{ github.base_ref }}"
-
-            BASE_SHA=$(git merge-base HEAD "origin/${{ github.base_ref }}")
-            CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD)
-
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            CHANGED_FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")
-
-          else
-            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
-          fi
-
-          - name: Detect changed services
-            id: set-matrix
-            run: |
-              set -euo pipefail
-
-              FILES=$(git diff --name-only HEAD~1 HEAD)
-
-              MATRIX=$(echo "$FILES" | python3 ci/ci_tools.py detect)
-
-              echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          MATRIX=$(echo "$FILES" | python3 ci/ci_tools.py detect)
 
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "$MATRIX"
-
-      - name: Skipped services summary
-        run: |
-          MATRIX='${{ steps.set-matrix.outputs.matrix }}'
-
-          IN_MATRIX=$(echo "$MATRIX" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service',[])))")
-
-          for S in cart catalog orders; do
-            echo "$IN_MATRIX" | grep -qw "$S" || \
-            bash scripts/ci/helpers.sh write_job_summary "$S" "-" "-" "skipped"
-          done
+          echo "Detected: $MATRIX"
 
 
+  # -----------------------------
+  # 2. Build & Push Docker Images
+  # -----------------------------
   build-and-push:
     runs-on: ubuntu-latest
     needs: detect-changes
@@ -86,31 +54,33 @@ jobs:
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: AWS login
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: ECR login
+      - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Compute tags
+      - name: Compute image values
         id: vars
         run: |
           IMAGE_TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
+
           ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
 
-          ECR_URI=$(python3 ci/ci_tools.py ecr "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$SERVICE")
+          ECR_URI=$(python3 ci/ci_tools.py ecr \
             "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "${{ matrix.service }}")
 
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "uri=$ECR_URI" >> $GITHUB_OUTPUT
 
-      - name: Build & Push
+      - name: Build & Push Docker image
         uses: docker/build-push-action@v6
         with:
           context: src/${{ matrix.service }}
@@ -121,28 +91,32 @@ jobs:
             ${{ steps.vars.outputs.uri }}:latest
 
 
+  # -----------------------------
+  # 3. Update Helm Values (GitOps)
+  # -----------------------------
   update-helm-values:
     runs-on: ubuntu-latest
     needs: [detect-changes, build-and-push]
     if: github.event_name != 'pull_request' && needs.detect-changes.outputs.matrix != '{"service":[]}' && needs.detect-changes.outputs.matrix != ''
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: AWS login
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: ECR login
+      - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Git config
+      - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -156,20 +130,21 @@ jobs:
           SERVICES=$(echo "$MATRIX" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service',[])))")
 
           IMAGE_TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
+
           ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
 
           for S in $SERVICES; do
-            ECR_URI=$(bash scripts/ci/helpers.sh build_ecr_uri \
+            ECR_URI=$(python3 ci/ci_tools.py ecr \
               "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$S")
 
-            python3 ci/ci_tools.py patch ...
+            python3 ci/ci_tools.py patch \
               "src/$S/chart/values.yaml" "$IMAGE_TAG" "$ECR_URI"
           done
 
       - name: Commit changes
         run: |
           git add .
-          git commit -m "chore: update helm values [skip ci]" || exit 0
+          git commit -m "chore: update image tags [skip ci]" || exit 0
 
       - name: Push changes
         run: git push origin main
