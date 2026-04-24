@@ -1,410 +1,166 @@
-# CI/CD Pipeline for the Retail Store Sample Application
-#
-# This workflow automates three concerns on every push to `main`:
-#   1. Change detection  — determine which services (cart, catalog, orders) have changed.
-#   2. Docker build/push — build each changed service's image and push it to Amazon ECR.
-#   3. Helm values update — rewrite image.tag and image.repository in each service's
-#                           chart/values.yaml and commit the result back to main.
-#
-# On pull requests the workflow runs in read-only mode: images are built but not pushed
-# to ECR and no Helm values commit is made.
-#
-# Manual runs are supported via workflow_dispatch with no required inputs.
-
 name: CI/CD Pipeline
 
-# ---------------------------------------------------------------------------
-# Triggers (Requirement 1.1, 1.2, 1.3)
-# ---------------------------------------------------------------------------
-# push        — runs the full pipeline (build + push + Helm update) on every
-#               commit that lands on main.
-# pull_request — runs in read-only mode (build only) so that PRs targeting main
-#               are validated without side-effects.
-# workflow_dispatch — allows any authorised user to trigger the pipeline manually
-#               from the GitHub Actions UI or API with no required inputs.
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
-# ---------------------------------------------------------------------------
-# Permissions (Requirement 8.2)
-# ---------------------------------------------------------------------------
-# Permissions are set at the workflow level to the minimum required:
-#   contents: write      — needed to commit and push Helm values.yaml updates
-#                          back to main after a successful image push.
-#   id-token: write      — needed for GitHub OIDC federation so the workflow can
-#                          assume an AWS IAM role without storing long-lived
-#                          AWS credentials as secrets.
-#   pull-requests: read  — needed to read pull-request metadata (e.g. base SHA
-#                          for change detection on PR events).
 permissions:
   contents: write
   id-token: write
   pull-requests: read
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Job: detect-changes (Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 7.2)
-  # ---------------------------------------------------------------------------
-  # Diffs the changed file paths and emits a JSON matrix of services that need
-  # to be rebuilt.  Downstream jobs are skipped when the matrix is empty.
+
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+
     steps:
-      - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Determine which files changed, handling all three trigger types:
-      #   push            — diff between the before-SHA and the current SHA
-      #   pull_request    — diff between the merge-base and HEAD
-      #   workflow_dispatch — diff HEAD~1..HEAD (treat as a normal push)
+      - name: Ensure scripts are executable
+        run: chmod +x scripts/ci/helpers.sh
+
       - name: Detect changed services
         id: set-matrix
+        shell: bash
         run: |
           set -euo pipefail
+
+          BASE_SHA=""
+          HEAD_SHA="${{ github.sha }}"
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # Use the three-dot merge-base diff so we only see PR-specific changes
-            CHANGED_FILES=$(git diff --name-only \
-              "origin/${{ github.base_ref }}...HEAD")
-          elif [ "${{ github.event_name }}" = "push" ] && \
-               [ -n "${{ github.event.before }}" ] && \
-               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            # Normal push: diff between the previous HEAD and the new HEAD
-            CHANGED_FILES=$(git diff --name-only \
-              "${{ github.event.before }}" "${{ github.sha }}")
+            git fetch origin "${{ github.base_ref }}"
+
+            BASE_SHA=$(git merge-base HEAD "origin/${{ github.base_ref }}")
+            CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD)
+
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            CHANGED_FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")
+
           else
-            # workflow_dispatch or first push to branch (no before SHA)
-            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || \
-              git diff --name-only "$(git rev-list --max-parents=0 HEAD)" HEAD)
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
           fi
 
-          # Pipe the changed file list into the helper to get the JSON matrix
-          MATRIX=$(echo "$CHANGED_FILES" | \
-            bash scripts/ci/helpers.sh detect_changed_services)
+          MATRIX=$(echo "$CHANGED_FILES" | bash scripts/ci/helpers.sh detect_changed_services)
 
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "Detected matrix: ${MATRIX}"
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "$MATRIX"
 
-      # Write a summary row with status 'skipped' for every service that is
-      # NOT included in the matrix (Requirement 7.2).
-      - name: Write skipped-service summary rows
+      - name: Skipped services summary
         run: |
-          set -euo pipefail
-
           MATRIX='${{ steps.set-matrix.outputs.matrix }}'
 
-          # Determine which services are in the matrix
-          IN_MATRIX=$(echo "$MATRIX" | \
-            python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(d.get('service',[])))")
+          IN_MATRIX=$(echo "$MATRIX" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service',[])))")
 
-          for SERVICE in cart catalog orders; do
-            if ! echo "$IN_MATRIX" | grep -qw "$SERVICE"; then
-              bash scripts/ci/helpers.sh write_job_summary \
-                "$SERVICE" "—" "—" "skipped"
-            fi
+          for S in cart catalog orders; do
+            echo "$IN_MATRIX" | grep -qw "$S" || \
+            bash scripts/ci/helpers.sh write_job_summary "$S" "-" "-" "skipped"
           done
 
-  # ---------------------------------------------------------------------------
-  # Job: build-and-push (Requirements 3.1–3.6, 4.1–4.4, 5.1–5.3, 5.5–5.6,
-  #                      7.1, 8.1, 8.2)
-  # ---------------------------------------------------------------------------
-  # Runs as a matrix job over every service emitted by detect-changes.
-  # Each matrix instance builds the service's Docker image, pushes both the
-  # short-SHA tag and `latest` to ECR (push branch only), and writes a summary
-  # row.  On pull requests the push step is skipped so the job acts as a pure
-  # build validator.
-  #
-  # Skipped entirely when the matrix is empty (no services changed).
+
   build-and-push:
     runs-on: ubuntu-latest
     needs: detect-changes
-    # Skip this job when no services changed (matrix would be empty).
-    if: needs.detect-changes.outputs.matrix != '{"service":[]}'
+    if: needs.detect-changes.outputs.matrix != '{"service":[]}' && needs.detect-changes.outputs.matrix != ''
 
-    # -------------------------------------------------------------------------
-    # Matrix strategy (Requirement 2.4)
-    # -------------------------------------------------------------------------
-    # Each element of the `service` array from detect-changes becomes one
-    # parallel runner instance.  fail-fast: false ensures a failure in one
-    # service does not cancel the builds for the remaining services.
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
 
-    # -------------------------------------------------------------------------
-    # Job outputs (consumed by update-helm-values)
-    # -------------------------------------------------------------------------
-    outputs:
-      image_tag: ${{ steps.set-outputs.outputs.image_tag }}
-      ecr_uri:   ${{ steps.set-outputs.outputs.ecr_uri }}
-
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Check out the repository (Requirement 3.1)
-      # -----------------------------------------------------------------------
-      - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # 2. Authenticate to AWS via OIDC (Requirements 4.1, 4.2, 4.3, 4.4)
-      # -----------------------------------------------------------------------
-      # Assumes the IAM role whose ARN is stored in the AWS_ROLE_ARN secret.
-      # No long-lived AWS credentials are stored; the OIDC token is exchanged
-      # for short-lived credentials automatically by the action.
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      - name: AWS login
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:     ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
-      # 3. Log in to Amazon ECR (Requirement 5.1)
-      # -----------------------------------------------------------------------
-      # The `registry` output from this step is used to construct the full
-      # image URI in subsequent steps.
-      - name: Log in to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+      - name: ECR login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # -----------------------------------------------------------------------
-      # 4. Derive image tag and ECR URI (Requirements 3.3, 5.4)
-      # -----------------------------------------------------------------------
-      # Calls helpers.sh to produce the 7-char short-SHA tag and the full ECR
-      # repository URI, then exports them as step outputs for later steps.
-      - name: Set image tag and ECR URI outputs
-        id: set-outputs
-        env:
-          AWS_ACCOUNT_ID: ${{ steps.ecr-login.outputs.registry }}
+      - name: Compute tags
+        id: vars
         run: |
-          set -euo pipefail
-
           IMAGE_TAG=$(bash scripts/ci/helpers.sh derive_image_tag "${{ github.sha }}")
-
-          # build_ecr_uri expects the bare account ID; extract it from the
-          # registry hostname (<account>.dkr.ecr.<region>.amazonaws.com).
-          ACCOUNT_ID=$(echo "$AWS_ACCOUNT_ID" | cut -d'.' -f1)
+          ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
 
           ECR_URI=$(bash scripts/ci/helpers.sh build_ecr_uri \
             "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "${{ matrix.service }}")
 
-          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "ecr_uri=${ECR_URI}"     >> "$GITHUB_OUTPUT"
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "uri=$ECR_URI" >> $GITHUB_OUTPUT
 
-          echo "Image tag : ${IMAGE_TAG}"
-          echo "ECR URI   : ${ECR_URI}"
-
-      # -----------------------------------------------------------------------
-      # 5. Build (and conditionally push) the Docker image
-      #    (Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 5.2, 5.3, 5.5, 5.6)
-      # -----------------------------------------------------------------------
-      # docker/build-push-action builds the image and, when not running on a
-      # pull request, pushes both the short-SHA tag and `latest` to ECR.
-      #
-      # GitHub Actions cache (type=gha) is used for Docker layer caching,
-      # scoped per service so matrix instances do not share cache entries.
-      #
-      # The `push` input is set to false on pull_request events so that the
-      # job acts as a pure build validator without writing to ECR.
-      - name: Build and push Docker image
-        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+      - name: Build & Push
+        uses: docker/build-push-action@v6
         with:
-          context:    src/${{ matrix.service }}/
-          file:       src/${{ matrix.service }}/Dockerfile
-          push:       ${{ github.event_name != 'pull_request' }}
+          context: src/${{ matrix.service }}
+          file: src/${{ matrix.service }}/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ steps.set-outputs.outputs.ecr_uri }}:${{ steps.set-outputs.outputs.image_tag }}
-            ${{ steps.set-outputs.outputs.ecr_uri }}:latest
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
+            ${{ steps.vars.outputs.uri }}:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.uri }}:latest
 
-      # -----------------------------------------------------------------------
-      # 6. Write job summary row (Requirement 7.1)
-      # -----------------------------------------------------------------------
-      # Appends a Markdown table row to the GitHub Actions step summary.
-      # On pull requests the push was skipped, so the status is "built";
-      # on push events the image was pushed, so the status is "pushed".
-      - name: Write job summary
-        if: always()
-        run: |
-          set -euo pipefail
 
-          IMAGE_TAG="${{ steps.set-outputs.outputs.image_tag }}"
-          ECR_URI="${{ steps.set-outputs.outputs.ecr_uri }}"
-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            STATUS="built"
-          else
-            STATUS="pushed"
-          fi
-
-          bash scripts/ci/helpers.sh write_job_summary \
-            "${{ matrix.service }}" "$IMAGE_TAG" "$ECR_URI" "$STATUS"
-
-  # ---------------------------------------------------------------------------
-  # Job: update-helm-values (Requirements 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7)
-  # ---------------------------------------------------------------------------
-  # Runs once after ALL matrix instances of build-and-push complete, and only
-  # on push events (not pull requests).  It iterates over every service that
-  # was built, patches image.tag and image.repository in each service's
-  # chart/values.yaml, then commits and pushes all changes in a single commit.
-  #
-  # Because build-and-push is a matrix job, its per-instance outputs cannot be
-  # aggregated natively in GitHub Actions.  Instead this job reconstructs the
-  # image tag and ECR URI from first principles using the same helper functions
-  # (derive_image_tag, build_ecr_uri) and the same inputs (github.sha, AWS
-  # account ID from ECR login, AWS_REGION, service name from the matrix JSON).
-  #
-  # Skipped entirely on pull requests (Requirement 6.7).
   update-helm-values:
     runs-on: ubuntu-latest
-    needs:
-      - detect-changes
-      - build-and-push
-    # Only run on push events (not pull requests) and when there are services
-    # to update (Requirement 6.7).
-    if: >-
-      github.event_name != 'pull_request' &&
-      needs.detect-changes.outputs.matrix != '{"service":[]}'
+    needs: [detect-changes, build-and-push]
+    if: github.event_name != 'pull_request' && needs.detect-changes.outputs.matrix != '{"service":[]}' && needs.detect-changes.outputs.matrix != ''
 
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Check out the repository with a token that allows pushing
-      #    (Requirement 6.3 — the job must be able to commit back to main)
-      # -----------------------------------------------------------------------
-      - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
-          token:       ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # -----------------------------------------------------------------------
-      # 2. Authenticate to AWS via OIDC
-      #    (needed to log in to ECR so we can reconstruct the ECR registry
-      #    hostname and derive the account ID)
-      # -----------------------------------------------------------------------
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      - name: AWS login
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region:     ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
-      # 3. Log in to Amazon ECR to obtain the registry hostname
-      #    The `registry` output has the form:
-      #      <account-id>.dkr.ecr.<region>.amazonaws.com
-      #    We extract the account ID from it to reconstruct ECR URIs.
-      # -----------------------------------------------------------------------
-      - name: Log in to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+      - name: ECR login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # -----------------------------------------------------------------------
-      # 4. Configure git identity for the commit (Requirement 6.3)
-      # -----------------------------------------------------------------------
-      - name: Configure git identity
+      - name: Git config
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # -----------------------------------------------------------------------
-      # 5. Patch values.yaml for each changed service (Requirements 6.1, 6.2)
-      # -----------------------------------------------------------------------
-      # Iterates over the services in the detect-changes matrix JSON, derives
-      # the image tag and ECR URI using the same helpers used in build-and-push,
-      # then calls patch_helm_values to update image.tag and image.repository
-      # in each service's chart/values.yaml.
-      - name: Patch Helm values for changed services
-        env:
-          MATRIX_JSON: ${{ needs.detect-changes.outputs.matrix }}
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+      - name: Patch Helm values
         run: |
           set -euo pipefail
 
-          # Derive the image tag from the triggering commit SHA
+          MATRIX='${{ needs.detect-changes.outputs.matrix }}'
+
+          SERVICES=$(echo "$MATRIX" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service',[])))")
+
           IMAGE_TAG=$(bash scripts/ci/helpers.sh derive_image_tag "${{ github.sha }}")
+          ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
 
-          # Extract the bare AWS account ID from the ECR registry hostname
-          # Format: <account-id>.dkr.ecr.<region>.amazonaws.com
-          ACCOUNT_ID=$(echo "$ECR_REGISTRY" | cut -d'.' -f1)
-
-          # Parse the list of changed services from the matrix JSON
-          SERVICES=$(echo "$MATRIX_JSON" | \
-            python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service', [])))")
-
-          echo "Services to update: ${SERVICES}"
-          echo "Image tag          : ${IMAGE_TAG}"
-
-          for SERVICE in $SERVICES; do
+          for S in $SERVICES; do
             ECR_URI=$(bash scripts/ci/helpers.sh build_ecr_uri \
-              "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$SERVICE")
-
-            VALUES_FILE="src/${SERVICE}/chart/values.yaml"
-
-            echo "Patching ${VALUES_FILE} → tag=${IMAGE_TAG}, repo=${ECR_URI}"
+              "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$S")
 
             bash scripts/ci/helpers.sh patch_helm_values \
-              "$VALUES_FILE" "$IMAGE_TAG" "$ECR_URI"
+              "src/$S/chart/values.yaml" "$IMAGE_TAG" "$ECR_URI"
           done
 
-      # -----------------------------------------------------------------------
-      # 6. Stage all modified values.yaml files (Requirement 6.5)
-      # -----------------------------------------------------------------------
-      - name: Stage modified values.yaml files
+      - name: Commit changes
         run: |
-          set -euo pipefail
-          git add src/*/chart/values.yaml
+          git add .
+          git commit -m "chore: update helm values [skip ci]" || exit 0
 
-      # -----------------------------------------------------------------------
-      # 7. Commit the staged changes (Requirements 6.3, 6.4, 6.5)
-      # -----------------------------------------------------------------------
-      # Generates the commit message via generate_commit_message so the format
-      # is consistent with the helper's output (includes [skip ci] to prevent
-      # re-triggering this workflow — Requirement 6.4).
-      - name: Commit Helm values changes
-        env:
-          MATRIX_JSON: ${{ needs.detect-changes.outputs.matrix }}
-        run: |
-          set -euo pipefail
-
-          IMAGE_TAG=$(bash scripts/ci/helpers.sh derive_image_tag "${{ github.sha }}")
-
-          # Build a comma-separated service list for the commit message
-          SERVICES_CSV=$(echo "$MATRIX_JSON" | \
-            python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('service', [])))")
-
-          COMMIT_MSG=$(bash scripts/ci/helpers.sh generate_commit_message \
-            "$SERVICES_CSV" "$IMAGE_TAG")
-
-          echo "Commit message: ${COMMIT_MSG}"
-          git commit -m "$COMMIT_MSG"
-
-      # -----------------------------------------------------------------------
-      # 8. Push to main with retry on conflict (Requirement 6.6)
-      # -----------------------------------------------------------------------
-      # Retries up to 3 times.  On a push conflict (exit code != 0) it rebases
-      # against origin/main before retrying.  After 3 failures the job exits
-      # with a non-zero code so the workflow is marked as failed.
-      - name: Push to main (with retry on conflict)
-        run: |
-          set -euo pipefail
-
-          for i in 1 2 3; do
-            git push origin main && break
-            if [ $i -lt 3 ]; then
-              echo "Push attempt ${i} failed — rebasing and retrying..."
-              git pull --rebase origin main
-            else
-              echo "Push failed after 3 attempts"
-              exit 1
-            fi
-          done
+      - name: Push changes
+        run: git push origin main
