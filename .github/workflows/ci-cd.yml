@@ -50,7 +50,16 @@ jobs:
             CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
           fi
 
-          MATRIX=$(echo "$CHANGED_FILES" | bash scripts/ci/helpers.sh detect_changed_services)
+          - name: Detect changed services
+            id: set-matrix
+            run: |
+              set -euo pipefail
+
+              FILES=$(git diff --name-only HEAD~1 HEAD)
+
+              MATRIX=$(echo "$FILES" | python3 ci/ci_tools.py detect)
+
+              echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           echo "$MATRIX"
@@ -92,10 +101,10 @@ jobs:
       - name: Compute tags
         id: vars
         run: |
-          IMAGE_TAG=$(bash scripts/ci/helpers.sh derive_image_tag "${{ github.sha }}")
+          IMAGE_TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
           ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
 
-          ECR_URI=$(bash scripts/ci/helpers.sh build_ecr_uri \
+          ECR_URI=$(python3 ci/ci_tools.py ecr "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$SERVICE")
             "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "${{ matrix.service }}")
 
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
@@ -146,14 +155,14 @@ jobs:
 
           SERVICES=$(echo "$MATRIX" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service',[])))")
 
-          IMAGE_TAG=$(bash scripts/ci/helpers.sh derive_image_tag "${{ github.sha }}")
+          IMAGE_TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
           ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
 
           for S in $SERVICES; do
             ECR_URI=$(bash scripts/ci/helpers.sh build_ecr_uri \
               "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$S")
 
-            bash scripts/ci/helpers.sh patch_helm_values \
+            python3 ci/ci_tools.py patch ...
               "src/$S/chart/values.yaml" "$IMAGE_TAG" "$ECR_URI"
           done
 
