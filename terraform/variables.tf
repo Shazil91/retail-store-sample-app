@@ -55,3 +55,10 @@ variable "enable_monitoring" {
   type        = bool
   default     = false
 }
+
+variable "github_repository" {
+  description = "GitHub repository allowed to assume the CI/CD IAM role. Format: <org-or-user>/<repo> (e.g. my-org/retail-store-sample-app)"
+  type        = string
+  # No default — must be set explicitly to avoid accidentally granting access
+  # to the wrong repository.
+}

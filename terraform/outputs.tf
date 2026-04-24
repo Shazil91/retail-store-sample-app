@@ -119,3 +119,37 @@ output "useful_commands" {
     describe_cluster    = "kubectl cluster-info"
   }
 }
+
+# =============================================================================
+# GITHUB ACTIONS IAM
+# =============================================================================
+
+output "github_actions_role_arn" {
+  description = "ARN of the IAM role for GitHub Actions OIDC. Set this as the AWS_ROLE_ARN secret in your GitHub repository."
+  value       = aws_iam_role.github_actions.arn
+}
+
+output "github_actions_oidc_provider_arn" {
+  description = "ARN of the GitHub Actions OIDC identity provider"
+  value       = aws_iam_openid_connect_provider.github_actions.arn
+}
+
+output "ecr_repository_urls" {
+  description = "ECR repository URLs for each service. These are the values pushed to by the CI/CD workflow."
+  value       = { for k, v in aws_ecr_repository.services : k => v.repository_url }
+}
+
+output "github_actions_setup_instructions" {
+  description = "Instructions for wiring the IAM role into GitHub Actions"
+  value       = <<-EOT
+    1. Copy the role ARN from `github_actions_role_arn` output.
+    2. In your GitHub repository go to Settings → Secrets and variables → Actions.
+    3. Add a new Repository Secret:
+         Name : AWS_ROLE_ARN
+         Value: <paste role ARN here>
+    4. Add a new Repository Variable:
+         Name : AWS_REGION
+         Value: ${var.aws_region}
+    5. The workflow will now authenticate via OIDC — no access keys needed.
+  EOT
+}
