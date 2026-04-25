@@ -5,7 +5,9 @@ env:
 on:
   push:
     branches: [main]
-    paths: ['src/**']
+    paths:
+      - 'src/**'
+      - '!**/*.md'
   workflow_dispatch:
 
 permissions:
