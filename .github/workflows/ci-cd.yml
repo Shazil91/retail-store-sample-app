@@ -2,20 +2,24 @@ name: CI/CD Pipeline
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   push:
     branches: [main]
     paths:
       - 'src/**'
       - '!**/*.md'
+
   pull_request:
     branches: [main]
+
   workflow_dispatch:
 
 permissions:
   contents: write
   id-token: write
   pull-requests: read
+
 
 jobs:
 
@@ -24,6 +28,7 @@ jobs:
   # -----------------------------
   detect-changes:
     runs-on: ubuntu-latest
+
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       has_changes: ${{ steps.set-matrix.outputs.has_changes }}
@@ -39,21 +44,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          FILES=$(git diff --name-only HEAD~1 HEAD || true)
+          BASE="${{ github.event.before }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="origin/main"
+          fi
+
+          git fetch origin main --depth=2 || true
+
+          FILES=$(git diff --name-only $BASE ${{ github.sha }} || true)
+
+          if [ -z "$FILES" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "matrix={\"service\":[]}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           MATRIX=$(echo "$FILES" | python3 ci/ci_tools.py detect)
 
           COUNT=$(echo "$MATRIX" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('service',[])))")
 
           if [ "$COUNT" -eq 0 ]; then
-            echo "No services changed"
             echo "has_changes=false" >> $GITHUB_OUTPUT
           else
             echo "has_changes=true" >> $GITHUB_OUTPUT
           fi
 
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Detected: $MATRIX"
 
 
   # -----------------------------
@@ -69,8 +85,7 @@ jobs:
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -82,20 +97,20 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Compute image values
+      - name: Compute values
         id: vars
         run: |
-          IMAGE_TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
+          TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
 
-          ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-          ECR_URI=$(python3 ci/ci_tools.py ecr \
+          URI=$(python3 ci/ci_tools.py ecr \
             "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "${{ matrix.service }}")
 
-          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "uri=$URI" >> $GITHUB_OUTPUT
 
-      - name: Build & Push Docker image
+      - name: Build & Push
         uses: docker/build-push-action@v6
         with:
           context: src/${{ matrix.service }}
@@ -107,7 +122,7 @@ jobs:
 
 
   # -----------------------------
-  # 3. Update Helm Values (GitOps)
+  # 3. Update Helm (GitOps)
   # -----------------------------
   update-helm-values:
     runs-on: ubuntu-latest
@@ -115,23 +130,21 @@ jobs:
     if: github.event_name != 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Configure AWS (OIDC)
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to ECR
-        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Configure Git
+      - name: Git config
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -144,22 +157,21 @@ jobs:
 
           SERVICES=$(echo "$MATRIX" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('service',[])))")
 
-          IMAGE_TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
+          TAG=$(python3 ci/ci_tools.py tag "${{ github.sha }}")
 
-          ACCOUNT_ID=$(echo "${{ steps.ecr.outputs.registry }}" | cut -d'.' -f1)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
           for S in $SERVICES; do
-            ECR_URI=$(python3 ci/ci_tools.py ecr \
-              "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$S")
+            URI=$(python3 ci/ci_tools.py ecr "$ACCOUNT_ID" "${{ vars.AWS_REGION }}" "$S")
 
             python3 ci/ci_tools.py patch \
-              "src/$S/chart/values.yaml" "$IMAGE_TAG" "$ECR_URI"
+              "src/$S/chart/values.yaml" "$TAG" "$URI"
           done
 
       - name: Commit changes
         run: |
           git add .
-          git commit -m "chore: update image tags [skip ci]" || exit 0
+          git diff --cached --quiet && exit 0 || git commit -m "chore: update image tags [skip ci]"
 
       - name: Push changes
         run: git push origin main
