@@ -245,21 +245,41 @@ aws eks update-kubeconfig --name retail-store --region <region>
 
 > **Note**: This step is only required if you're using the **Production branch** for automated deployments. Skip this step if using the **Public Application branch** for simple deployment.
 
-For GitHub Actions, first configure secrets so the pipelines can be automatically triggered:
+For GitHub Actions, this fork uses **OIDC-based authentication** instead of long-lived IAM credentials. No `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` are needed.
 
-**Create an IAM User, policies, and generate credentials**
+**Setup OIDC Authentication:**
 
-**Go to your GitHub repo → Settings → Secrets and variables → Actions → New repository secret.**
+1. Create an OIDC Identity Provider in IAM:
+   - Provider URL: `https://token.actions.githubusercontent.com`
+   - Audience: `sts.amazonaws.com`
 
+2. Create an IAM Role (e.g. `github-actions-ecr-push-dev`) with this trust policy:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:<YOUR_ORG>/<YOUR_REPO>:*"
+      }
+    }
+  }]
+}
+```
 
-| Secret Name           | Value                              |
-|-----------------------|------------------------------------|
-| `AWS_ACCESS_KEY_ID`   | `Your AWS Access Key ID`           |
-| `AWS_SECRET_ACCESS_KEY` | `Your AWS Secret Access Key`     |
-| `AWS_REGION`          | `region-name`                       |
-| `AWS_ACCOUNT_ID`        | `your-account-id` |
+3. Add only this secret to your GitHub repo → Settings → Secrets and variables → Actions:
 
-
+| Secret Name  | Value         |
+|--------------|---------------|
+| `AWS_REGION` | `region-name` |
 
 > [!IMPORTANT]
 > Once the entire cluster is created, any changes pushed to the repository will automatically trigger GitHub Actions.
@@ -351,7 +371,29 @@ terraform destroy --auto-approve
 
 
 
-## Troubleshooting
+## My Contributions
+
+This fork extends the original project with the following improvements:
+
+### 🔐 Secure CI/CD with OIDC Authentication
+- Replaced long-lived IAM access keys with **AWS IAM OIDC federation** for GitHub Actions
+- GitHub Actions now assumes an IAM role using short-lived tokens — no static credentials stored in GitHub secrets
+- Applied **least-privilege IAM policy** scoped to only the required ECR repositories and actions
+
+### 🐳 Docker Build Fix
+- Fixed `GOPROXY` in the catalog service Dockerfile — replaced unreliable `goproxy.io` with the official `proxy.golang.org` to ensure stable Go module downloads during builds
+
+### ✅ End-to-End GitOps Pipeline (Verified Working)
+- GitHub Actions detects changes per microservice using path filtering
+- Builds and pushes Docker images to private Amazon ECR
+- Auto-updates Helm chart `values.yaml` with the new image tag
+- ArgoCD detects the Git change and syncs the updated deployment to EKS automatically
+
+**Tech Stack:** `AWS EKS` · `Terraform` · `ArgoCD` · `GitHub Actions` · `Amazon ECR` · `Docker` · `Helm` · `Kubernetes` · `IAM OIDC` · `Go` · `Java` · `Python`
+
+---
+
+
 
 ### Common Issues
 
