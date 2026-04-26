@@ -2,348 +2,337 @@
 
 ## Overview
 
-This design describes a GitHub Actions CI/CD workflow for the retail store sample application. The workflow automates three concerns on every push to `main`:
+This document describes the design for a GitHub Actions CI/CD pipeline that automates Docker image builds and Helm chart updates for the retail store sample application. The pipeline covers five services — `cart`, `catalog`, `orders`, `checkout`, and `ui` — each living under `src/<service>/`.
 
-1. **Change detection** — determine which of the three services (`cart`, `catalog`, `orders`) have changed files.
-2. **Docker build and push** — build each changed service's image and push it to a per-service Amazon ECR repository.
-3. **Helm values update** — rewrite `image.tag` and `image.repository` in each changed service's `chart/values.yaml` and commit the result back to `main`.
-
-The workflow also runs in a read-only mode on pull requests (build only, no push, no commit) and supports manual dispatch.
+The pipeline is triggered on pushes and pull requests to `main`. It detects which services have changed, builds Docker images for those services, pushes them to Amazon ECR, and then updates each service's Helm chart `values.yaml` with the new image tag and repository. Each service's build and update jobs run independently so a failure in one service does not block others.
 
 ### Key Design Decisions
 
-- **OIDC authentication** — no long-lived AWS credentials are stored; the workflow assumes an IAM role via GitHub OIDC federation.
-- **Dynamic matrix** — change detection produces a JSON array that drives a matrix build job, so only affected services consume runner minutes.
-- **Single commit for Helm updates** — all `values.yaml` changes from a run are batched into one commit with `[skip ci]` to avoid re-triggering the workflow.
-- **Pinned action SHAs** — every third-party action is pinned to a commit SHA to prevent supply-chain attacks.
+- **Single workflow file**: All five services are handled in one `.github/workflows/ci.yml` file using a matrix-style approach with per-service jobs. This keeps the pipeline easy to read and maintain without duplicating workflow logic across multiple files.
+- **`dorny/paths-filter` for change detection**: This action provides reliable, well-tested path filtering with boolean outputs per filter, avoiding the need to shell-script `git diff` manually.
+- **`aws-actions/configure-aws-credentials` + `aws-actions/amazon-ecr-login`**: The official AWS GitHub Actions handle credential configuration and ECR login in a composable, auditable way.
+- **`[skip ci]` in commit messages**: Helm update commits include `[skip ci]` to prevent the pipeline from re-triggering on its own commits, avoiding infinite loops.
+- **PR guard on Helm updates**: Helm chart commits are gated behind `github.event_name == 'push'` so pull request runs only validate builds without writing back to the repository.
 
 ---
 
 ## Architecture
 
-### Workflow Job Graph
+The pipeline is structured as a directed acyclic graph (DAG) of jobs:
 
 ```mermaid
 flowchart TD
-    A[push / PR / workflow_dispatch] --> B[detect-changes]
-    B -->|matrix: changed services| C[build-and-push]
-    C -->|all services done| D[update-helm-values]
-    D --> E[commit-and-push]
+    A[Trigger: push / pull_request to main] --> B[detect-changes]
+    B --> C{cart changed?}
+    B --> D{catalog changed?}
+    B --> E{orders changed?}
+    B --> F{checkout changed?}
+    B --> G{ui changed?}
 
-    B -->|matrix empty| F[workflow exits successfully]
+    C -- yes --> H[build-cart]
+    D -- yes --> I[build-catalog]
+    E -- yes --> J[build-orders]
+    F -- yes --> K[build-checkout]
+    G -- yes --> L[build-ui]
+
+    H --> M[update-helm-cart]
+    I --> N[update-helm-catalog]
+    J --> O[update-helm-orders]
+    K --> P[update-helm-checkout]
+    L --> Q[update-helm-ui]
+
+    style M fill:#f9f,stroke:#333
+    style N fill:#f9f,stroke:#333
+    style O fill:#f9f,stroke:#333
+    style P fill:#f9f,stroke:#333
+    style Q fill:#f9f,stroke:#333
 ```
 
-### Job Responsibilities
+Pink nodes (Helm update jobs) only run on `push` events, not pull requests.
 
-| Job | Runs on | Condition | Responsibility |
-|---|---|---|---|
-| `detect-changes` | `ubuntu-latest` | always | Diff changed paths, emit JSON matrix |
-| `build-and-push` | `ubuntu-latest` | matrix non-empty | Build Docker image, push to ECR (push branch only) |
-| `update-helm-values` | `ubuntu-latest` | push to `main` only | Patch `values.yaml`, commit, push with retry |
-
-### Workflow File Location
+### Job Dependency Chain (per service)
 
 ```
-.github/workflows/ci-cd.yml
+detect-changes → build-<service> → update-helm-<service>
 ```
+
+Each service's chain is fully independent. A failure in `build-cart` has no effect on `build-catalog` or any other service.
 
 ---
 
 ## Components and Interfaces
 
-### 1. Change Detector (`detect-changes` job)
+### 1. Workflow File
 
-Uses `git diff --name-only` between `HEAD` and `HEAD~1` (or the merge base on PRs) to list changed files. Each file path is tested against the prefix `src/<service>/`. The output is a JSON array of service names, e.g. `["cart","orders"]`, set as a job output named `matrix`.
+**Location**: `.github/workflows/ci.yml`
 
-**Inputs:** Git ref context (`github.sha`, `github.event.before`)  
-**Outputs:** `matrix` — JSON string, e.g. `{"service":["cart","catalog"]}`
+The single workflow file contains:
 
-If the array is empty the downstream jobs are skipped via `if: needs.detect-changes.outputs.matrix != '{"service":[]}'`.
+| Job | Purpose |
+|-----|---------|
+| `detect-changes` | Runs `dorny/paths-filter` to produce boolean outputs per service |
+| `build-<service>` (×5) | Configures AWS credentials, logs in to ECR, builds and pushes Docker image |
+| `update-helm-<service>` (×5) | Updates `image.tag` and `image.repository` in `values.yaml`, commits and pushes |
 
-### 2. Image Builder / Pusher (`build-and-push` job)
+### 2. Change Detection Job
 
-Runs as a matrix job over the services emitted by `detect-changes`. Each matrix instance:
+Uses [`dorny/paths-filter@v3`](https://github.com/dorny/paths-filter) to evaluate path filters for each service directory. Outputs a boolean string (`'true'`/`'false'`) per service.
 
-1. Checks out the repository.
-2. Authenticates to AWS via OIDC (`aws-actions/configure-aws-credentials`).
-3. Logs in to ECR (`aws-actions/amazon-ecr-login`).
-4. Builds the Docker image with `docker/build-push-action`, using GitHub Actions cache for layer caching.
-5. Tags the image with both the short Git SHA and `latest`.
-6. Pushes both tags (skipped on pull requests).
-7. Writes per-service outputs (`image_tag`, `ecr_uri`) consumed by the Helm updater.
-
-**Inputs:** `matrix.service`, `github.sha`, `AWS_ROLE_ARN` secret, `AWS_REGION` variable  
-**Outputs:** `image_tag` (short SHA), `ecr_uri` (full ECR repository URI)
-
-### 3. Helm Values Updater (`update-helm-values` job)
-
-Runs once after all matrix instances of `build-and-push` complete, only on pushes to `main`. It:
-
-1. Checks out the repository with a token that allows pushing.
-2. Iterates over each service that was built.
-3. Uses `sed` (or `yq`) to patch `image.tag` and `image.repository` in `src/<service>/chart/values.yaml`.
-4. Stages all changed `values.yaml` files.
-5. Commits with message `chore: update <services> image tag to <sha> [skip ci]`.
-6. Pushes to `main`, retrying up to 3 times with `git pull --rebase` on conflict.
-
-**Inputs:** outputs from `build-and-push` matrix jobs, `GITHUB_TOKEN`  
-**Side effects:** one git commit pushed to `main`
-
-### 4. Job Summary Writer
-
-Each job appends a Markdown table row to `$GITHUB_STEP_SUMMARY`:
-
-```
-| Service | Image Tag | ECR URI | Status |
+```yaml
+- uses: dorny/paths-filter@v3
+  id: filter
+  with:
+    filters: |
+      cart:
+        - 'src/cart/**'
+      catalog:
+        - 'src/catalog/**'
+      orders:
+        - 'src/orders/**'
+      checkout:
+        - 'src/checkout/**'
+      ui:
+        - 'src/ui/**'
 ```
 
-Skipped services are included with status `skipped`.
+Downstream jobs consume these outputs via `needs.detect-changes.outputs.<service>`.
 
-### 5. GitHub Actions Secrets and Variables
+### 3. Build Jobs
 
-| Name | Type | Purpose |
-|---|---|---|
-| `AWS_ROLE_ARN` | Secret | IAM role ARN for OIDC assumption |
-| `AWS_REGION` | Variable | AWS region (e.g. `us-east-1`) |
-| `GITHUB_TOKEN` | Built-in | Commit and push Helm updates |
+Each build job follows the same sequence of steps:
+
+1. `actions/checkout@v4` — check out the repository
+2. `aws-actions/configure-aws-credentials@v4` — configure AWS credentials from secrets
+3. `aws-actions/amazon-ecr-login@v2` — authenticate Docker with ECR, outputs `registry`
+4. `docker build` — build image from `src/<service>/Dockerfile` with context `src/<service>/`
+5. `docker push` — push SHA-tagged image
+6. `docker push` — push `latest`-tagged image
+
+The image tag is derived from the triggering commit SHA:
+
+```yaml
+IMAGE_TAG: ${{ github.sha }}
+# Used as: ${IMAGE_TAG::7}  (first 7 characters)
+```
+
+Full image URI format: `<registry>/retail-store-sample-<service>:<sha7>`
+
+### 4. Helm Update Jobs
+
+Each Helm update job:
+
+1. `actions/checkout@v4` — check out the repository
+2. Uses `sed` to update `image.tag` and `image.repository` in `src/<service>/chart/values.yaml`
+3. Configures git user identity (`github-actions[bot]`)
+4. Commits with message: `ci: update <service> image tag to <sha7> [skip ci]`
+5. Pushes to `main` using `GITHUB_TOKEN`
+
+The `sed` commands target the specific YAML keys:
+
+```bash
+sed -i "s|  tag:.*|  tag: \"${IMAGE_TAG}\"|" src/<service>/chart/values.yaml
+sed -i "s|  repository:.*|  repository: \"${ECR_REGISTRY}/retail-store-sample-<service>\"|" src/<service>/chart/values.yaml
+```
+
+**Guard condition**: `if: github.event_name == 'push'` — skips the entire job on pull requests.
+
+### 5. Secrets and Variables
+
+| Name | Type | Used By | Purpose |
+|------|------|---------|---------|
+| `AWS_ACCESS_KEY_ID` | Secret | build jobs | AWS authentication |
+| `AWS_SECRET_ACCESS_KEY` | Secret | build jobs | AWS authentication |
+| `AWS_REGION` | Secret or Variable | build jobs | ECR region |
+| `GITHUB_TOKEN` | Built-in secret | Helm update jobs | Push commits to repo |
 
 ---
 
 ## Data Models
 
-### Service Descriptor
-
-Each service is described by a static configuration embedded in the workflow:
+### Workflow Trigger Configuration
 
 ```yaml
-services:
-  cart:
-    path: src/cart
-    dockerfile: src/cart/Dockerfile
-    ecr_repo: retail-store-sample-cart
-    values_yaml: src/cart/chart/values.yaml
-  catalog:
-    path: src/catalog
-    dockerfile: src/catalog/Dockerfile
-    ecr_repo: retail-store-sample-catalog
-    values_yaml: src/catalog/chart/values.yaml
-  orders:
-    path: src/orders
-    dockerfile: src/orders/Dockerfile
-    ecr_repo: retail-store-sample-orders
-    values_yaml: src/orders/chart/values.yaml
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 ```
 
-### Change Detection Output
+### Workflow Permissions
 
-```json
-{
-  "service": ["cart", "catalog"]
-}
-```
-
-An empty result looks like `{"service":[]}` and causes downstream jobs to be skipped.
-
-### Image Tag Format
-
-```
-<short-git-sha>          # e.g. a1b2c3d  (7 hex chars from git rev-parse --short HEAD)
-latest
-```
-
-### ECR Repository URI Pattern
-
-```
-<aws-account-id>.dkr.ecr.<aws-region>.amazonaws.com/retail-store-sample-<service>
-```
-
-Example: `123456789012.dkr.ecr.us-east-1.amazonaws.com/retail-store-sample-cart`
-
-### Helm `values.yaml` Patch (per service)
-
-Before:
 ```yaml
-image:
-  repository: public.ecr.aws/aws-containers/retail-store-sample-cart
-  tag: "1.2.2"
+permissions:
+  contents: write      # Required for Helm update job to push commits
+  id-token: write      # Supports future OIDC-based AWS authentication
 ```
 
-After:
+### Change Detection Output Schema
+
+The `detect-changes` job exposes outputs consumed by downstream jobs:
+
+```yaml
+outputs:
+  cart:     ${{ steps.filter.outputs.cart }}
+  catalog:  ${{ steps.filter.outputs.catalog }}
+  orders:   ${{ steps.filter.outputs.orders }}
+  checkout: ${{ steps.filter.outputs.checkout }}
+  ui:       ${{ steps.filter.outputs.ui }}
+```
+
+Each value is the string `'true'` or `'false'`.
+
+### Build Job Conditional
+
+```yaml
+if: needs.detect-changes.outputs.<service> == 'true'
+```
+
+### Image Tag Derivation
+
+```bash
+IMAGE_TAG="${GITHUB_SHA::7}"
+# Example: commit abc1234def → IMAGE_TAG=abc1234
+```
+
+### Helm `values.yaml` Fields Updated
+
+For each service, two fields in `src/<service>/chart/values.yaml` are updated:
+
 ```yaml
 image:
-  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/retail-store-sample-cart
-  tag: "a1b2c3d"
+  repository: <account-id>.dkr.ecr.<region>.amazonaws.com/retail-store-sample-<service>
+  tag: "<sha7>"
 ```
 
-The patch is applied with `yq e '.image.tag = "<tag>" | .image.repository = "<uri>"' -i values.yaml` to avoid fragile regex-based `sed` on YAML.
+Current baseline values (from existing `values.yaml` files):
 
-### Git Commit Message Format
+| Service | Current repository | Current tag |
+|---------|-------------------|-------------|
+| cart | `public.ecr.aws/aws-containers/retail-store-sample-cart` | `1.2.2` |
+| catalog | `public.ecr.aws/aws-containers/retail-store-sample-catalog` | `1.2.2` |
+| orders | `public.ecr.aws/aws-containers/retail-store-sample-orders` | `1.2.2` |
+| checkout | `public.ecr.aws/aws-containers/retail-store-sample-checkout` | `1.2.2` |
+| ui | `public.ecr.aws/aws-containers/retail-store-sample-ui` | `1.2.2` |
+
+After a successful pipeline run, `repository` is updated to the private ECR URI and `tag` is updated to the 7-character commit SHA.
+
+### Commit Message Format
 
 ```
-chore: update cart,orders image tag to a1b2c3d [skip ci]
+ci: update <service> image tag to <sha7> [skip ci]
 ```
 
-When only one service is updated:
-```
-chore: update catalog image tag to a1b2c3d [skip ci]
-```
+Examples:
+- `ci: update cart image tag to abc1234 [skip ci]`
+- `ci: update catalog image tag to abc1234 [skip ci]`
 
 ---
 
 ## Correctness Properties
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+This feature is a GitHub Actions workflow — declarative YAML configuration that orchestrates external services (GitHub Actions runners, AWS ECR, Docker). The pipeline itself does not contain pure functions with testable input/output behavior. The correctness of the workflow is verified through:
 
-### Property 1: Change Detection Correctness
+- **Integration testing**: Running the workflow against a real or mocked environment
+- **Snapshot/schema validation**: Linting the workflow YAML with `actionlint`
+- **Example-based tests**: Verifying specific scenarios (PR skips Helm update, `[skip ci]` prevents re-trigger)
 
-*For any* set of changed file paths, the change detector SHALL produce a matrix that contains a service if and only if at least one path in the input set has that service's path prefix (`src/cart/`, `src/catalog/`, or `src/orders/`). No service appears in the matrix unless its prefix is present; no service is omitted when its prefix is present.
+Property-based testing is **not applicable** to this feature because:
+1. The workflow is declarative configuration, not a function with inputs/outputs
+2. Correctness depends on external service behavior (GitHub Actions, AWS ECR, Docker)
+3. Running 100 iterations would require 100 actual CI runs — prohibitively expensive
+4. The behavior does not vary meaningfully with arbitrary generated inputs
 
-**Validates: Requirements 2.1, 2.2, 2.3, 2.4**
-
-### Property 2: Image Tag Derivation
-
-*For any* full 40-character Git SHA string, the derived Image_Tag SHALL be a 7-character string that is a prefix of the full SHA and consists only of hexadecimal characters.
-
-**Validates: Requirements 3.3**
-
-### Property 3: ECR Repository URI Construction
-
-*For any* valid AWS account ID (12-digit string), AWS region string, and service name, the constructed ECR_Repository URI SHALL match the pattern `<account-id>.dkr.ecr.<region>.amazonaws.com/retail-store-sample-<service>` exactly.
-
-**Validates: Requirements 5.4**
-
-### Property 4: Helm Values Patch Preserves Structure
-
-*For any* valid `values.yaml` content, new image tag string, and new ECR repository URI, applying the Helm_Updater patch SHALL produce a YAML document where `image.tag` equals the new tag, `image.repository` equals the new URI, and all other top-level and nested fields are unchanged from the original.
-
-**Validates: Requirements 6.1, 6.2**
-
-### Property 5: Commit Message Format
-
-*For any* non-empty list of service names and any image tag string, the generated commit message SHALL start with `chore: update`, contain all service names, contain the image tag, and end with `[skip ci]`.
-
-**Validates: Requirements 6.3, 6.4**
-
-### Property 6: Single Commit for Multiple Services
-
-*For any* non-empty list of 1 to 3 changed services in a single workflow run, the Helm_Updater SHALL produce exactly one git commit regardless of how many services are in the list.
-
-**Validates: Requirements 6.5**
-
-### Property 7: Job Summary Completeness
-
-*For any* workflow run result containing a list of service outcomes (built, pushed, or skipped), the generated job summary SHALL contain one row per service, and each row SHALL include the service name, its Image_Tag (or "—" if skipped), the ECR_Repository URI (or "—" if skipped), and its status.
-
-**Validates: Requirements 7.1, 7.2**
-
-### Property 8: Action SHA Pinning
-
-*For any* action reference in the workflow YAML (lines matching `uses: <owner>/<repo>@<ref>`), the `<ref>` component SHALL be a 40-character lowercase hexadecimal string (a full Git commit SHA), not a mutable tag or branch name.
-
-**Validates: Requirements 8.1**
+The testing strategy below covers all acceptance criteria through integration and example-based tests.
 
 ---
 
 ## Error Handling
 
-### Build Failures
+### AWS Authentication Failure (Requirement 2.3)
 
-- If `docker build` exits non-zero, the matrix job for that service fails immediately. Other matrix instances continue independently.
-- The failure is surfaced in the GitHub Actions UI and blocks any branch protection rules configured on the workflow.
+If `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` are invalid or expired, `aws-actions/configure-aws-credentials` will fail with a descriptive error. The job exits immediately; subsequent steps (ECR login, Docker build, push) do not run.
 
-### ECR Push Failures
+### ECR Login Failure (Requirement 3.3)
 
-- If `docker push` fails (network error, permission denied, repository not found), the matrix job fails before reaching the Helm update step.
-- The Helm update job depends on all matrix instances succeeding (`needs: build-and-push` with default `success()` condition), so a push failure prevents any Helm commit.
+If `aws-actions/amazon-ecr-login` fails (e.g., insufficient IAM permissions), the job exits before the Docker build step. The error message from the action identifies the ECR endpoint and the IAM error.
 
-### Helm Commit Conflicts
+### Docker Build Failure (Requirement 4.5)
 
-- If `git push` is rejected due to a concurrent commit (another workflow run or a direct push), the Helm updater performs `git pull --rebase origin main` and retries the push.
-- The retry loop runs up to 3 times. After 3 failures the job exits with a non-zero code.
-- The retry is implemented as a shell loop:
+If `docker build` exits non-zero, the step fails and the job stops. The push step and Helm update job do not run for that service. Other services' jobs are unaffected.
 
-```bash
-for i in 1 2 3; do
-  git push origin main && break
-  if [ $i -lt 3 ]; then
-    git pull --rebase origin main
-  else
-    echo "Push failed after 3 attempts"
-    exit 1
-  fi
-done
-```
+### Image Push Failure / Missing ECR Repository (Requirements 5.3, 5.4)
 
-### Empty Matrix
+If the ECR repository does not exist, `docker push` returns a `repository does not exist` error. The job fails; the Helm update job is not triggered because it depends on the build job succeeding (`needs: build-<service>` with default `success()` condition).
 
-- When `detect-changes` produces `{"service":[]}`, the `build-and-push` and `update-helm-values` jobs are skipped via an `if:` condition.
-- The workflow exits with a green status so that branch protection is not blocked.
+### Missing `image.tag` in `values.yaml` (Requirement 6.5)
 
-### AWS Authentication Failures
+The `sed` command targets the pattern `  tag:.*` under the `image:` block. If this key is absent, `sed` makes no substitution and the file is unchanged. A subsequent `git diff --exit-code` check can detect this and fail the job with a descriptive message. This guard should be added to the Helm update step.
 
-- If `configure-aws-credentials` fails (invalid role ARN, OIDC misconfiguration, expired token), the step exits non-zero and the job fails immediately.
-- No subsequent steps (ECR login, docker push, Helm update) execute.
+### `[skip ci]` Loop Prevention (Requirement 8.4)
+
+GitHub Actions natively skips workflow runs when the commit message contains `[skip ci]`. The Helm update commit message always includes this string, so the pipeline does not re-trigger on its own commits.
+
+### Parallel Failure Isolation (Requirement 7.3)
+
+GitHub Actions jobs are independent by default. A failed `build-cart` job does not cancel `build-catalog` or any other job. Each service's chain fails or succeeds independently.
 
 ---
 
 ## Testing Strategy
 
-### Overview
+This feature is CI/CD infrastructure. The appropriate testing approach is:
 
-This feature is a GitHub Actions workflow — primarily declarative YAML configuration with small shell script fragments for change detection, YAML patching, commit message generation, and summary writing. The testable logic lives in these shell/script components, not in the workflow runner itself.
+### 1. Workflow Linting (Static Analysis)
 
-**PBT applicability assessment:** The workflow YAML itself (trigger config, job structure, action references) is infrastructure configuration — not suitable for property-based testing. However, the *logic components* embedded in the workflow (change detection, URI construction, YAML patching, commit message formatting, summary generation) are pure functions with meaningful input variation. PBT applies to these components.
+Use [`actionlint`](https://github.com/rhysd/actionlint) to statically validate the workflow YAML:
 
-### Unit and Property Tests
-
-Extract the logic components into standalone shell scripts or a small helper script (e.g., `scripts/ci/helpers.sh`) that can be tested in isolation with [Bats](https://github.com/bats-core/bats-core) (Bash Automated Testing System) and [Hypothesis](https://hypothesis.readthedocs.io/) or [fast-check](https://fast-check.dev/) for property generation if a Node/Python harness is preferred.
-
-**Property-based tests** (minimum 100 iterations each):
-
-| Property | Test approach |
-|---|---|
-| P1: Change detection correctness | Generate random file path lists; assert matrix = services with matching prefixes |
-| P2: Image tag derivation | Generate random 40-char hex strings; assert output is 7-char prefix |
-| P3: ECR URI construction | Generate random account IDs, regions, service names; assert URI pattern |
-| P4: Helm values patch | Generate random `values.yaml` + tag + repo; assert patched fields correct, others unchanged |
-| P5: Commit message format | Generate random service lists + tags; assert message structure |
-| P6: Single commit | Generate 1–3 service lists; assert commit count = 1 |
-| P7: Summary completeness | Generate random service outcome lists; assert all rows present with correct fields |
-| P8: Action SHA pinning | Parse workflow YAML; assert all `uses:` refs are 40-char hex |
-
-Each property test MUST be tagged:
-```
-# Feature: github-actions-cicd, Property <N>: <property_text>
+```bash
+actionlint .github/workflows/ci.yml
 ```
 
-**Example-based unit tests:**
+This catches:
+- Invalid action references
+- Incorrect expression syntax (`${{ }}`)
+- Missing required inputs for actions
+- Type mismatches in job outputs
 
-- Empty matrix → workflow exits successfully (Requirement 2.5)
-- Retry logic: 1 failure then success → job succeeds; 3 failures → job fails (Requirement 6.6)
-- PR event → push and commit steps are skipped (Requirements 5.6, 6.7)
+### 2. Example-Based Integration Tests
 
-### Smoke Tests (Workflow YAML Static Analysis)
+These are manual or semi-automated tests run against the actual GitHub Actions environment:
 
-Use a YAML parser (e.g., `yq` or Python `pyyaml`) to assert structural properties of the workflow file:
+| Test | Scenario | Expected Result |
+|------|----------|----------------|
+| T1 | Push to `main` modifying only `src/cart/` | Only `build-cart` and `update-helm-cart` run |
+| T2 | Push to `main` modifying `src/cart/` and `src/catalog/` | Both service chains run in parallel |
+| T3 | Pull request modifying `src/catalog/` | `build-catalog` runs; `update-helm-catalog` is skipped |
+| T4 | Push to `main` with no changes to any `src/<service>/` | All build and Helm update jobs are skipped |
+| T5 | Push with invalid AWS credentials | `build-*` jobs fail at credential configuration step |
+| T6 | Helm update commit triggers pipeline | Pipeline skips all jobs due to `[skip ci]` in commit message |
+| T7 | `build-cart` fails (bad Dockerfile) | `update-helm-cart` does not run; other services unaffected |
+| T8 | Push modifying all 5 services | All 5 build jobs run in parallel; all 5 Helm update jobs run after their respective builds |
 
-- Trigger block contains `push: branches: [main]`, `pull_request: branches: [main]`, and `workflow_dispatch`.
-- Permissions block contains `contents: write`, `id-token: write`, `pull-requests: read`.
-- All `uses:` references are pinned to 40-char SHAs (overlaps with Property 8).
-- Push and commit steps have `if: github.event_name != 'pull_request'` conditions.
-- `aws-actions/configure-aws-credentials` step uses `role-to-assume: ${{ secrets.AWS_ROLE_ARN }}`.
-- `aws-actions/amazon-ecr-login` step is present in the build job.
+### 3. Smoke Tests (Post-Deployment Verification)
 
-### Integration Tests
+After the pipeline runs successfully:
 
-Run against a real (or localstack-mocked) AWS environment:
+- Verify ECR repository contains the new image tag
+- Verify `src/<service>/chart/values.yaml` contains the updated `image.tag` and `image.repository`
+- Verify the commit in `main` has the correct message format with `[skip ci]`
 
-- Trigger a workflow run on a test branch; verify the correct ECR image appears with the expected tag.
-- Verify the `latest` tag is also pushed.
-- Verify `values.yaml` is updated in the repository after a successful push run.
-- Verify no `values.yaml` commit is made on a PR run.
+### 4. Unit Tests for Shell Logic
 
-### Test Configuration
+The `sed` substitution commands and SHA truncation logic can be tested locally:
 
-- Property tests: minimum **100 iterations** per property.
-- Bats tests run in CI as a separate job (`test-helpers`) that does not require AWS credentials.
-- Integration tests run only on the `main` branch and require the `AWS_ROLE_ARN` secret.
+```bash
+# Test SHA truncation
+GITHUB_SHA="abc1234def5678"
+IMAGE_TAG="${GITHUB_SHA::7}"
+assert [ "$IMAGE_TAG" = "abc1234" ]
+
+# Test sed substitution on a sample values.yaml
+sed -i "s|  tag:.*|  tag: \"abc1234\"|" /tmp/test-values.yaml
+grep 'tag: "abc1234"' /tmp/test-values.yaml
+```
+
+These can be run as part of a local pre-commit check or a separate shell test script.

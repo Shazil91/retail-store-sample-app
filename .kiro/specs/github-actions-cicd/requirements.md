@@ -2,129 +2,135 @@
 
 ## Introduction
 
-This feature adds a GitHub Actions CI/CD workflow to the retail store sample application — a microservices system composed of `cart` (Java/Spring Boot), `catalog` (Go), and `orders` (Java/Spring Boot) services, each with a Dockerfile and a Helm chart. The workflow automates three concerns: detecting which services have changed on a push, building and pushing Docker images for changed services to Amazon ECR, and updating the `image.tag` value in each service's Helm chart `values.yaml` so that the repository reflects the new image version. The `app` umbrella chart aggregates all service charts and does not have its own Dockerfile.
+This feature introduces a GitHub Actions CI/CD pipeline for the retail store sample application. The pipeline detects file changes per service/component, builds Docker images, pushes them to Amazon ECR, and updates the `image.tag` field in each service's Helm chart `values.yaml` after a successful push. The pipeline covers five services: `cart` (Java/Spring Boot), `catalog` (Go), `orders` (Java/Spring Boot), `checkout` (Node.js/TypeScript), and `ui` (Java/Spring Boot).
 
 ## Glossary
 
-- **CI_CD_Workflow**: The GitHub Actions workflow defined in `.github/workflows/` that orchestrates the build and release pipeline.
-- **Service**: One of the independently deployable components — `cart`, `catalog`, or `orders` — each located under `src/<service>/`.
-- **Change_Detector**: The job or step responsible for determining which services have file changes in a given push.
-- **Image_Builder**: The job or step responsible for building a Docker image from a service's `Dockerfile`.
-- **ECR**: Amazon Elastic Container Registry — the target registry where Docker images are pushed.
-- **Helm_Updater**: The job or step responsible for updating `image.tag` in a service's `src/<service>/chart/values.yaml`.
-- **Image_Tag**: The Docker image tag derived from the Git SHA of the triggering commit (e.g., `git rev-parse --short HEAD`).
-- **Service_Matrix**: A dynamic GitHub Actions matrix constructed from the list of changed services, used to fan out build jobs in parallel.
-- **ECR_Repository**: A per-service repository in Amazon ECR named after the service (e.g., `retail-store-sample-cart`).
-- **OIDC_Role**: An AWS IAM role assumed by the CI_CD_Workflow via GitHub Actions OIDC federation, granting ECR push and pull permissions without long-lived credentials.
+- **Pipeline**: The GitHub Actions workflow defined in `.github/workflows/`.
+- **Service**: One of the five application components — `cart`, `catalog`, `orders`, `checkout`, or `ui` — each located under `src/<service>/`.
+- **ECR**: Amazon Elastic Container Registry, the target Docker image registry.
+- **ECR_Repository**: The per-service ECR repository where Docker images are stored, named `retail-store-sample-<service>`.
+- **Image_Tag**: The Docker image tag written to `src/<service>/chart/values.yaml` under `image.tag`, used by Helm to deploy the correct image version.
+- **Change_Detection**: The process of determining which services have file changes in a given commit or pull request.
+- **Build_Job**: The per-service GitHub Actions job that builds and pushes a Docker image.
+- **Helm_Update_Job**: The per-service GitHub Actions job that updates `image.tag` in `values.yaml` after a successful image push.
+- **AWS_Credentials**: The AWS access key ID and secret access key stored as GitHub Actions secrets, used to authenticate with ECR.
+- **Git_Commit**: A commit made by the Pipeline to the repository to persist Helm chart tag updates.
 
 ---
 
 ## Requirements
 
-### Requirement 1: Workflow Trigger
+### Requirement 1: Per-Service Change Detection
 
-**User Story:** As a developer, I want the CI/CD workflow to run automatically on pushes to the main branch, so that every merged change is built and released without manual intervention.
+**User Story:** As a developer, I want the pipeline to detect which services have changed, so that only affected services are built and pushed, avoiding unnecessary work.
 
 #### Acceptance Criteria
 
-1. WHEN a push event targets the `main` branch, THE CI_CD_Workflow SHALL start execution.
-2. WHEN a pull request targets the `main` branch, THE CI_CD_Workflow SHALL start execution in a read-only mode that builds images but does not push to ECR or update Helm values.
-3. THE CI_CD_Workflow SHALL allow manual triggering via `workflow_dispatch` with no required inputs.
+1. WHEN a push or pull request event targets the `main` branch, THE Pipeline SHALL evaluate file path filters for each service directory (`src/cart/**`, `src/catalog/**`, `src/orders/**`, `src/checkout/**`, `src/ui/**`).
+2. WHEN files under `src/<service>/` are modified in a triggering event, THE Pipeline SHALL set a boolean output indicating that the corresponding service has changed.
+3. WHEN no files under `src/<service>/` are modified in a triggering event, THE Pipeline SHALL skip the Build_Job and Helm_Update_Job for that service.
+4. THE Pipeline SHALL evaluate change detection for all five services independently and in parallel.
 
 ---
 
-### Requirement 2: Per-Service Change Detection
+### Requirement 2: AWS Authentication
 
-**User Story:** As a developer, I want the workflow to detect which services have changed, so that only affected services are rebuilt and redeployed, reducing build time and unnecessary image churn.
+**User Story:** As a pipeline operator, I want the pipeline to authenticate with AWS using stored secrets, so that it can push images to ECR without embedding credentials in code.
 
 #### Acceptance Criteria
 
-1. WHEN a push occurs, THE Change_Detector SHALL compare the changed file paths against the path prefixes `src/cart/`, `src/catalog/`, and `src/orders/`.
-2. WHEN files under `src/<service>/` have changed, THE Change_Detector SHALL mark that service as requiring a build.
-3. WHEN no files under a service's path prefix have changed, THE Change_Detector SHALL exclude that service from the Service_Matrix.
-4. THE Change_Detector SHALL produce a Service_Matrix containing only the services that require a build.
-5. WHEN the Service_Matrix is empty (no services changed), THE CI_CD_Workflow SHALL exit successfully without executing build or update jobs.
+1. WHEN a Build_Job starts, THE Pipeline SHALL configure AWS credentials using the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` GitHub Actions secrets.
+2. THE Pipeline SHALL use the `AWS_REGION` GitHub Actions secret or variable to specify the target AWS region for ECR operations.
+3. IF the AWS credentials are invalid or expired, THEN THE Pipeline SHALL fail the Build_Job with a descriptive authentication error and SHALL NOT proceed to image build or push steps.
 
 ---
 
-### Requirement 3: Docker Image Build
+### Requirement 3: ECR Login
 
-**User Story:** As a developer, I want each changed service's Docker image to be built using its Dockerfile, so that the image reflects the latest source code.
+**User Story:** As a pipeline operator, I want the pipeline to log in to Amazon ECR before pushing images, so that Docker has the credentials needed to push to the private registry.
 
 #### Acceptance Criteria
 
-1. WHEN a service is included in the Service_Matrix, THE Image_Builder SHALL build the Docker image using the `Dockerfile` located at `src/<service>/Dockerfile`.
-2. THE Image_Builder SHALL set the Docker build context to `src/<service>/`.
-3. THE Image_Builder SHALL tag the built image with the Image_Tag derived from the short Git SHA of the triggering commit.
-4. THE Image_Builder SHALL also tag the built image with `latest`.
-5. IF the Docker build step exits with a non-zero status, THEN THE CI_CD_Workflow SHALL fail the job for that service and report the error.
-6. THE Image_Builder SHALL use Docker layer caching (e.g., GitHub Actions cache or inline cache) to reduce build time on subsequent runs.
+1. WHEN AWS credentials are successfully configured, THE Pipeline SHALL authenticate the Docker client with the ECR registry using the AWS CLI `ecr get-login-password` command piped to `docker login`.
+2. THE Pipeline SHALL derive the ECR registry URL from the AWS account ID and region in the format `<account-id>.dkr.ecr.<region>.amazonaws.com`.
+3. IF the ECR login step fails, THEN THE Pipeline SHALL fail the Build_Job and SHALL NOT proceed to the image build step.
 
 ---
 
-### Requirement 4: AWS Authentication
+### Requirement 4: Docker Image Build
 
-**User Story:** As a platform engineer, I want the workflow to authenticate to AWS using short-lived credentials via OIDC, so that no long-lived AWS access keys are stored as GitHub secrets.
+**User Story:** As a developer, I want each changed service to have its Docker image built from its `Dockerfile`, so that the latest code is packaged into a deployable artifact.
 
 #### Acceptance Criteria
 
-1. THE CI_CD_Workflow SHALL authenticate to AWS by assuming the OIDC_Role using the `aws-actions/configure-aws-credentials` action.
-2. THE CI_CD_Workflow SHALL read the OIDC_Role ARN from a GitHub Actions secret named `AWS_ROLE_ARN`.
-3. THE CI_CD_Workflow SHALL read the target AWS region from a GitHub Actions variable or secret named `AWS_REGION`.
-4. IF AWS authentication fails, THEN THE CI_CD_Workflow SHALL fail immediately and not proceed to image push or Helm update steps.
+1. WHEN a service is detected as changed, THE Build_Job SHALL build a Docker image using the `Dockerfile` located at `src/<service>/Dockerfile`.
+2. THE Build_Job SHALL set the Docker build context to `src/<service>/`.
+3. THE Build_Job SHALL tag the built image with the full ECR repository URI in the format `<account-id>.dkr.ecr.<region>.amazonaws.com/retail-store-sample-<service>:<image-tag>`.
+4. THE Build_Job SHALL derive the Image_Tag from the short SHA of the triggering Git commit (7 characters).
+5. IF the Docker build step fails, THEN THE Build_Job SHALL fail and SHALL NOT proceed to the image push step.
 
 ---
 
 ### Requirement 5: Docker Image Push to ECR
 
-**User Story:** As a platform engineer, I want built images pushed to Amazon ECR, so that the EKS cluster can pull them during deployment.
+**User Story:** As a developer, I want successfully built images to be pushed to Amazon ECR, so that they are available for deployment.
 
 #### Acceptance Criteria
 
-1. WHEN a service image has been successfully built, THE Image_Builder SHALL authenticate to ECR using the `aws-actions/amazon-ecr-login` action.
-2. THE Image_Builder SHALL push the image tagged with the Image_Tag to the ECR_Repository for that service.
-3. THE Image_Builder SHALL push the `latest` tag to the same ECR_Repository.
-4. THE CI_CD_Workflow SHALL derive the ECR_Repository URI from the AWS account ID, region, and a repository name following the pattern `retail-store-sample-<service>`.
-5. IF the ECR push step fails, THEN THE CI_CD_Workflow SHALL fail the job for that service and not proceed to the Helm update step for that service.
-6. WHEN running on a pull request, THE Image_Builder SHALL skip the ECR push step and only perform the build.
+1. WHEN a Docker image is successfully built, THE Build_Job SHALL push the image to the ECR_Repository for that service.
+2. THE Build_Job SHALL also push the same image tagged as `latest` to the ECR_Repository.
+3. IF the ECR_Repository for a service does not exist, THEN THE Build_Job SHALL fail with a descriptive error indicating the missing repository.
+4. IF the image push step fails, THEN THE Build_Job SHALL fail and SHALL NOT trigger the Helm_Update_Job for that service.
 
 ---
 
 ### Requirement 6: Helm Chart Image Tag Update
 
-**User Story:** As a developer, I want the workflow to update the `image.tag` field in each service's Helm chart `values.yaml` after a successful image push, so that the chart always references the image that was just built.
+**User Story:** As a developer, I want the Helm chart `values.yaml` for each service to be updated with the new image tag after a successful push, so that the chart reflects the latest deployable image.
 
 #### Acceptance Criteria
 
-1. WHEN an image has been successfully pushed to ECR, THE Helm_Updater SHALL update the `image.tag` field in `src/<service>/chart/values.yaml` to the Image_Tag used during the build.
-2. THE Helm_Updater SHALL update the `image.repository` field in `src/<service>/chart/values.yaml` to the full ECR_Repository URI for that service.
-3. THE Helm_Updater SHALL commit the updated `values.yaml` file(s) to the `main` branch with a commit message in the format `chore: update <service> image tag to <image-tag> [skip ci]`.
-4. THE CI_CD_Workflow SHALL include `[skip ci]` in the commit message to prevent the commit from re-triggering the workflow.
-5. IF multiple services are updated in the same workflow run, THE Helm_Updater SHALL batch all `values.yaml` changes into a single commit.
-6. IF the git commit or push step fails due to a concurrent commit conflict, THEN THE Helm_Updater SHALL retry the push up to 3 times with a rebase before failing the job.
-7. WHEN running on a pull request, THE Helm_Updater SHALL skip the commit and push step.
+1. WHEN a Docker image is successfully pushed to ECR, THE Helm_Update_Job SHALL update the `image.tag` field in `src/<service>/chart/values.yaml` to the Image_Tag used during the build.
+2. THE Helm_Update_Job SHALL update the `image.repository` field in `src/<service>/chart/values.yaml` to the full ECR repository URI (without the tag).
+3. THE Helm_Update_Job SHALL commit the updated `values.yaml` file to the repository with a commit message in the format `ci: update <service> image tag to <image-tag> [skip ci]`.
+4. THE Helm_Update_Job SHALL push the commit to the `main` branch using a GitHub token stored as the `GITHUB_TOKEN` secret.
+5. IF the `values.yaml` file for a service does not contain an `image.tag` field, THEN THE Helm_Update_Job SHALL fail with a descriptive error.
+6. THE Helm_Update_Job SHALL only run after the corresponding Build_Job completes successfully, using a `needs` dependency.
 
 ---
 
-### Requirement 7: Workflow Observability
+### Requirement 7: Pipeline Concurrency and Isolation
 
-**User Story:** As a developer, I want clear workflow status and summary output, so that I can quickly understand what was built, pushed, and updated in each run.
+**User Story:** As a developer, I want each service's build and update jobs to run independently, so that a failure in one service does not block other services from completing their pipeline.
 
 #### Acceptance Criteria
 
-1. WHEN the workflow completes, THE CI_CD_Workflow SHALL write a job summary to the GitHub Actions step summary listing each service processed, its Image_Tag, and the ECR_Repository URI.
-2. WHEN a service is skipped due to no detected changes, THE CI_CD_Workflow SHALL include that service in the summary with a "skipped" status.
-3. IF any job fails, THE CI_CD_Workflow SHALL surface the failure in the GitHub Actions UI with a non-zero exit code so that branch protection rules can block merges.
+1. THE Pipeline SHALL run Build_Jobs for all changed services in parallel, with no cross-service dependencies.
+2. THE Pipeline SHALL run each Helm_Update_Job only after its corresponding Build_Job succeeds, and independently of other services' Helm_Update_Jobs.
+3. WHEN multiple services change in the same commit, THE Pipeline SHALL complete all independent Build_Jobs and Helm_Update_Jobs without one service's failure blocking another service's jobs.
 
 ---
 
-### Requirement 8: Workflow Security
+### Requirement 8: Pipeline Trigger Configuration
 
-**User Story:** As a platform engineer, I want the workflow to follow least-privilege and supply-chain security practices, so that the CI/CD pipeline does not become an attack vector.
+**User Story:** As a developer, I want the pipeline to trigger on pushes and pull requests to the `main` branch, so that every code change is validated and deployed automatically.
 
 #### Acceptance Criteria
 
-1. THE CI_CD_Workflow SHALL pin all third-party GitHub Actions to a specific commit SHA rather than a mutable tag.
-2. THE CI_CD_Workflow SHALL set `permissions` at the workflow level to the minimum required: `contents: write` (for committing Helm updates), `id-token: write` (for OIDC), and `pull-requests: read`.
-3. THE CI_CD_Workflow SHALL not log or echo the values of any GitHub Actions secrets.
-4. WHERE Docker image scanning is enabled, THE CI_CD_Workflow SHALL run a vulnerability scan on the built image before pushing to ECR and fail the job if critical vulnerabilities are found.
+1. THE Pipeline SHALL trigger on `push` events targeting the `main` branch.
+2. THE Pipeline SHALL trigger on `pull_request` events targeting the `main` branch.
+3. WHEN triggered by a `pull_request` event, THE Pipeline SHALL execute change detection and Build_Jobs but SHALL NOT push commits to the repository (Helm_Update_Job is skipped).
+4. THE Pipeline SHALL include a `[skip ci]` string check so that commits made by the Helm_Update_Job do not re-trigger the pipeline.
+
+---
+
+### Requirement 9: Workflow Permissions
+
+**User Story:** As a pipeline operator, I want the workflow to have the minimum required permissions, so that the pipeline follows the principle of least privilege.
+
+#### Acceptance Criteria
+
+1. THE Pipeline SHALL declare `contents: write` permission to allow the Helm_Update_Job to commit and push changes.
+2. THE Pipeline SHALL declare `id-token: write` permission to support OIDC-based AWS authentication as an optional upgrade path.
+3. THE Pipeline SHALL NOT declare permissions beyond those required for ECR push and repository write operations.
