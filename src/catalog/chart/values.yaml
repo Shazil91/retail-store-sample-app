@@ -6,7 +6,7 @@ replicaCount: 1
 image:
   repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-catalog"
   pullPolicy: Always
-  tag: "40ccd30"
+  tag: "315686f"
 imagePullSecrets:
   - name: regcred
 nameOverride: ""
@@ -72,7 +72,7 @@ mysql:
   image:
     repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-catalog"
     pullPolicy: IfNotPresent
-    tag: "40ccd30"
+    tag: "315686f"
   service:
     type: ClusterIP
     port: 3306
