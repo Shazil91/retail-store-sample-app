@@ -1,5 +1,3 @@
-:
-
 🛒 Retail Store Microservices Platform
 AWS EKS with GitOps & Infrastructure as Code
 📌 Overview
