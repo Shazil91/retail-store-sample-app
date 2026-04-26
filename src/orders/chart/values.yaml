@@ -4,9 +4,9 @@
 
 replicaCount: 1
 image:
-  repository: public.ecr.aws/aws-containers/retail-store-sample-orders
+  repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-orders"
   pullPolicy: Always
-  tag: "1.2.2"
+  tag: "31f5526"
 imagePullSecrets:
   - name: regcred
 nameOverride: ""
@@ -79,9 +79,9 @@ app:
 postgresql:
   create: false
   image:
-    repository: public.ecr.aws/docker/library/postgres
+    repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-orders"
     pullPolicy: IfNotPresent
-    tag: "13"
+    tag: "31f5526"
   service:
     type: ClusterIP
     port: 5432
@@ -100,9 +100,9 @@ postgresql:
 rabbitmq:
   create: false
   image:
-    repository: public.ecr.aws/docker/library/rabbitmq
+    repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-orders"
     pullPolicy: IfNotPresent
-    tag: "3.8-management"
+    tag: "31f5526"
   service:
     type: ClusterIP
     amqp:
