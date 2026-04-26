@@ -6,7 +6,7 @@ replicaCount: 1
 image:
   repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-checkout"
   pullPolicy: Always
-  tag: "31f5526"
+  tag: "7264b56"
 imagePullSecrets:
   - name: regcred
 nameOverride: ''
@@ -69,7 +69,7 @@ redis:
   image:
     repository: "626311399924.dkr.ecr.us-west-2.amazonaws.com/retail-store-sample-checkout"
     pullPolicy: IfNotPresent
-    tag: "31f5526"
+    tag: "7264b56"
   service:
     type: ClusterIP
     port: 6379
