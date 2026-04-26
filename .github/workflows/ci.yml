@@ -223,6 +223,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "ci: update cart image tag to ${SHORT_TAG} [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
   update-helm-catalog:
@@ -266,6 +267,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "ci: update catalog image tag to ${SHORT_TAG} [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
   update-helm-orders:
@@ -309,6 +311,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "ci: update orders image tag to ${SHORT_TAG} [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
   update-helm-checkout:
@@ -352,6 +355,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "ci: update checkout image tag to ${SHORT_TAG} [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
   update-helm-ui:
@@ -364,7 +368,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::626311399924:role/github-actions-ecr-push-dev
+          role-to-assume: arn:aws:iam::626311399924:role/github-actions-ecr-push
           aws-region:     ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -395,4 +399,5 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "ci: update ui image tag to ${SHORT_TAG} [skip ci]"
+          git pull --rebase origin main
           git push origin main
